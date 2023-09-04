@@ -1,93 +1,103 @@
-use std::net::SocketAddr;
-use std::net::ToSocketAddrs;
-use std::option::Option;
-use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex};
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use containerd_shim as shim;
-use containerd_shim_wasm::libcontainer_instance::LibcontainerInstance;
-use containerd_shim_wasm::sandbox::instance::ExitCode;
-use containerd_shim_wasm::sandbox::instance_utils::determine_rootdir;
-use containerd_shim_wasm::sandbox::stdio::Stdio;
-use containerd_shim_wasm::sandbox::{error::Error, InstanceConfig, ShimCli};
-use executor::SpinExecutor;
-use libcontainer::container::builder::ContainerBuilder;
-use libcontainer::container::Container;
-use libcontainer::syscall::syscall::SyscallType;
-
-mod executor;
+use containerd_shim_wasm::container::{Engine, Instance, RuntimeContext};
+use containerd_shim_wasm::sandbox::{ShimCli, Stdio};
+use serde::de::DeserializeOwned;
+use spin_manifest::{Application, ApplicationTrigger};
+use spin_redis_engine::RedisTrigger;
+use spin_trigger::cli::NoArgs;
+use spin_trigger::loader::TriggerLoader;
+use spin_trigger::locked::build_locked_app;
+use spin_trigger::{RuntimeConfig, TriggerExecutor, TriggerExecutorBuilder};
+use spin_trigger_http::{CliArgs, HttpTrigger};
+use tokio::runtime::Runtime;
+use url::Url;
 
 const SPIN_ADDR: &str = "0.0.0.0:80";
-static DEFAULT_CONTAINER_ROOT_DIR: &str = "/run/containerd/spin";
-
-pub struct Wasi {
-    exit_code: ExitCode,
-    id: String,
-    stdio: Stdio,
-    bundle: String,
-    rootdir: PathBuf,
-}
-
-impl LibcontainerInstance for Wasi {
-    type Engine = ();
-
-    fn new_libcontainer(id: String, cfg: Option<&InstanceConfig<Self::Engine>>) -> Self {
-        let cfg = cfg.unwrap();
-        let bundle = cfg.get_bundle().unwrap_or_default();
-        let rootdir = determine_rootdir(
-            bundle.as_str(),
-            cfg.get_namespace().as_str(),
-            DEFAULT_CONTAINER_ROOT_DIR,
-        )
-        .unwrap();
-        Wasi {
-            exit_code: Arc::new((Mutex::new(None), Condvar::new())),
-            id,
-            stdio: Stdio::init_from_cfg(cfg).expect("failed to open stdio"),
-            bundle: cfg.get_bundle().unwrap_or_default(),
-            rootdir,
-        }
-    }
-
-    fn get_exit_code(&self) -> ExitCode {
-        self.exit_code.clone()
-    }
-
-    fn get_id(&self) -> String {
-        self.id.clone()
-    }
-
-    fn get_root_dir(&self) -> std::result::Result<PathBuf, Error> {
-        Ok(self.rootdir.clone())
-    }
-
-    fn build_container(&self) -> std::result::Result<Container, Error> {
-        let err_others = |err| Error::Others(format!("failed to create container: {}", err));
-        let spin_executor = SpinExecutor::new(self.stdio.take());
-        let container = ContainerBuilder::new(self.id.clone(), SyscallType::Linux)
-            .with_executor(spin_executor)
-            .with_root_path(self.rootdir.clone())
-            .map_err(err_others)?
-            .as_init(&self.bundle)
-            .with_systemd(false)
-            .with_detach(true)
-            .build()
-            .map_err(err_others)?;
-        Ok(container)
-    }
-}
 
 fn parse_addr(addr: &str) -> Result<SocketAddr> {
-    let addrs: SocketAddr = addr
-        .to_socket_addrs()?
+    addr.to_socket_addrs()?
         .next()
-        .ok_or_else(|| anyhow!("could not parse address: {}", addr))?;
-    Ok(addrs)
+        .with_context(|| format!("could not parse address: {addr}"))
+}
+
+#[derive(Clone, Default)]
+struct SpinEngine;
+
+impl Engine for SpinEngine {
+    fn name() -> &'static str {
+        "spin"
+    }
+
+    fn run(&self, _ctx: impl RuntimeContext, stdio: Stdio) -> anyhow::Result<i32> {
+        let rt = Runtime::new().context("failed to create runtime")?;
+        rt.block_on(async {
+            stdio.redirect().context("failed to redirect stdio")?;
+
+            log::info!(" >>> building spin application");
+            let app = spin_loader::from_file("/spin.toml", Some("/"))
+                .await
+                .context("failed to build spin application")?;
+
+            match app.info.trigger {
+                ApplicationTrigger::Http(_) => {
+                    log::info!(" >>> running spin http trigger");
+                    build_spin_trigger::<HttpTrigger>("/", app)
+                        .await
+                        .context("failed to build spin http trigger")?
+                        .run(CliArgs {
+                            address: parse_addr(SPIN_ADDR).unwrap(),
+                            tls_cert: None,
+                            tls_key: None,
+                        })
+                        .await
+                }
+                ApplicationTrigger::Redis(_) => {
+                    log::info!(" >>> running spin redis trigger");
+                    build_spin_trigger::<RedisTrigger>("/", app)
+                        .await
+                        .context("failed to build spin redis trigger")?
+                        .run(NoArgs)
+                        .await
+                }
+                _ => todo!("Only Http and Redis triggers are currently supported."),
+            }
+        })?;
+        Ok(0)
+    }
+}
+
+async fn build_spin_trigger<T>(working_dir: impl AsRef<Path>, app: Application) -> Result<T>
+where
+    T: spin_trigger::TriggerExecutor,
+    T::TriggerConfig: DeserializeOwned,
+{
+    let working_dir = working_dir.as_ref();
+
+    // Build and write app lock file
+    let app = build_locked_app(app, working_dir).context("building licked app")?;
+    let path = working_dir.join("spin.lock");
+    let buff = serde_json::to_string(&app).context("could not serialize locked app")?;
+    std::fs::write(&path, buff).context("could not write locked app")?;
+    let uri = Url::from_file_path(&path)
+        .map_err(|_| anyhow!("converting {path:?} to file URL"))?
+        .to_string();
+
+    // Build trigger config
+    let loader = TriggerLoader::new(working_dir, true);
+    let mut builder = TriggerExecutorBuilder::new(loader);
+    builder
+        .wasmtime_config_mut()
+        .cranelift_opt_level(wasmtime::OptLevel::Speed);
+    let config = RuntimeConfig::new(Some("/".into()));
+    builder.build(uri, config, Default::default()).await
 }
 
 fn main() {
-    shim::run::<ShimCli<Wasi>>("io.containerd.spin.v1", None);
+    shim::run::<ShimCli<Instance<SpinEngine>>>("io.containerd.spin.v1", None);
 }
 
 #[cfg(test)]

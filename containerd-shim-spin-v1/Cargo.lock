@@ -813,7 +813,7 @@ dependencies = [
 [[package]]
 name = "containerd-shim-wasm"
 version = "0.2.1"
-source = "git+https://github.com/containerd/runwasi?rev=7e978edeaf34b54efb895738357c805cf888b76d#7e978edeaf34b54efb895738357c805cf888b76d"
+source = "git+https://github.com/jprendes/runwasi?rev=f1d1ac4168b8fbe9f639dbc27d2c0c622fc08977#f1d1ac4168b8fbe9f639dbc27d2c0c622fc08977"
 dependencies = [
  "anyhow",
  "caps",

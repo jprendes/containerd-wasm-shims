@@ -1,89 +1,55 @@
+use std::path::Path;
+
+use anyhow::{Context, Result};
 use containerd_shim as shim;
-use containerd_shim_wasm::libcontainer_instance::LibcontainerInstance;
-use containerd_shim_wasm::sandbox::instance::ExitCode;
-use containerd_shim_wasm::sandbox::instance_utils::determine_rootdir;
-use containerd_shim_wasm::sandbox::Stdio;
-use containerd_shim_wasm::sandbox::{error::Error, InstanceConfig, ShimCli};
-use executor::WwsExecutor;
-use libcontainer::container::builder::ContainerBuilder;
-use libcontainer::container::Container;
-use libcontainer::syscall::syscall::SyscallType;
-use std::option::Option;
-use std::path::PathBuf;
+use containerd_shim_wasm::container::{Engine, Instance, RuntimeContext};
+use containerd_shim_wasm::sandbox::stdio::Stdio;
+use containerd_shim_wasm::sandbox::ShimCli;
+use tokio::runtime::Runtime;
+use wws_config::Config;
+use wws_router::Routes;
+use wws_server::serve;
 
-mod executor;
+/// URL to listen to in wws
+const WWS_ADDR: &str = "0.0.0.0";
+const WWS_PORT: u16 = 3000;
 
-static DEFAULT_CONTAINER_ROOT_DIR: &str = "/run/containerd/wws";
+#[derive(Clone, Default)]
+struct WwsEngine;
 
-pub struct Workers {
-    exit_code: ExitCode,
-    id: String,
-    // TODO: set the stdio to redirect the logs to the pod. Currently, we only set the
-    // stderr as Wasm Workers use stdin/stdout to pass and receive data. This behavior
-    // will change in the future.
-    // stdin: String,
-    // stdout: String,
-    stdio: Stdio,
-    bundle: String,
-    rootdir: PathBuf,
-}
-
-/// Implement the "default" interface from runwasi
-impl LibcontainerInstance for Workers {
-    type Engine = ();
-    fn new_libcontainer(id: String, cfg: Option<&InstanceConfig<Self::Engine>>) -> Self {
-        log::info!("[wws] new instance");
-        let cfg = cfg.unwrap();
-        let bundle = cfg.get_bundle().unwrap_or_default();
-        let rootdir = determine_rootdir(
-            bundle.as_str(),
-            cfg.get_namespace().as_str(),
-            DEFAULT_CONTAINER_ROOT_DIR,
-        )
-        .unwrap();
-        Workers {
-            exit_code: Default::default(),
-            id,
-            // TODO: set the stdio to redirect the logs to the pod. Currently, we only set the
-            // stderr as Wasm Workers use stdin/stdout to pass and receive data. This behavior
-            // will change in the future.
-            // stdin: cfg.get_stdin().unwrap_or_default(),
-            // stdout: cfg.get_stdout().unwrap_or_default(),
-            stdio: Stdio::init_from_cfg(cfg).expect("failed to open stdio"),
-            bundle,
-            rootdir,
-        }
+impl Engine for WwsEngine {
+    fn name() -> &'static str {
+        "wws"
     }
 
-    fn get_exit_code(&self) -> ExitCode {
-        self.exit_code.clone()
-    }
+    fn run(&self, _ctx: impl RuntimeContext, stdio: Stdio) -> Result<i32> {
+        let rt = Runtime::new().context("failed to create runtime")?;
+        rt.block_on(async {
+            stdio.stderr.redirect().context("failed to redirect stdio")?;
+            let root = Path::new("/");
 
-    fn get_id(&self) -> String {
-        self.id.clone()
-    }
+            let config = Config::load(root).unwrap_or_else(|err| {
+                log::error!("[wws] Error reading .wws.toml file. It will be ignored");
+                log::error!("[wws] Error: {err}");
+                Config::default()
+            });
 
-    fn get_root_dir(&self) -> std::result::Result<PathBuf, Error> {
-        Ok(self.rootdir.clone())
-    }
+            // Check if there're missing runtimes
+            if config.is_missing_any_runtime(root) {
+                log::error!("[wws] Required language runtimes are not installed. Some files may not be considered workers");
+                log::error!("[wws] You can install the missing runtimes with: wws runtimes install");
+            }
 
-    fn build_container(&self) -> std::result::Result<Container, Error> {
-        let err_others = |err| Error::Others(format!("failed to create container: {}", err));
-        let wws_executor = WwsExecutor::new(self.stdio.take());
+            let routes = Routes::new(root, "", Vec::new(), &config);
+            let server = serve(root, routes, WWS_ADDR, WWS_PORT, false, None).await?;
 
-        let container = ContainerBuilder::new(self.id.clone(), SyscallType::Linux)
-            .with_executor(wws_executor)
-            .with_root_path(self.rootdir.clone())
-            .map_err(err_others)?
-            .as_init(&self.bundle)
-            .with_systemd(false)
-            .with_detach(true)
-            .build()
-            .map_err(err_others)?;
-        Ok(container)
+            log::info!(" >>> notifying main thread we are about to start");
+            server.await.context("running wws server")
+        })?;
+        Ok(0)
     }
 }
 
 fn main() {
-    shim::run::<ShimCli<Workers>>("io.containerd.wws.v1", None);
+    shim::run::<ShimCli<Instance<WwsEngine>>>("io.containerd.wws.v1", None);
 }
